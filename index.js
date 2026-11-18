@@ -540,6 +540,50 @@ app.get("/api/services/my-services", async (req, res) => {
 });
 
 // ==========================================
+// PUBLIC: GET SINGLE APPROVED SERVICE
+// GET /api/services/:id
+// ==========================================
+
+app.get("/api/services/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid service ID.",
+      });
+    }
+
+    const service = await serviceCollection.findOne({
+      _id: new ObjectId(id),
+      approvalStatus: "approved",
+      isAvailable: true,
+    });
+
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found or currently unavailable.",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Service details fetched successfully.",
+      service,
+    });
+  } catch (error) {
+    console.error("Get single service error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch service details.",
+    });
+  }
+});
+
+// ==========================================
 // TECHNICIAN: UPDATE SERVICE
 // PUT /api/services/:id
 // ==========================================
@@ -986,6 +1030,7 @@ async function run() {
       console.log("Secure role selection API is configured!");
 
       console.log("Public Get Approved Services API is configured!");
+      console.log("Public Get Single Service API is configured!");
 
       console.log("Technician Add Service API is configured!");
       console.log("Technician My Services API is configured!");
@@ -1005,7 +1050,3 @@ async function run() {
 run();
 
 export default app;
-
-
-
-
