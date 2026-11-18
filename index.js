@@ -1,7 +1,7 @@
 
 import express from "express";
 import cors from "cors";
-import { MongoClient } from "mongodb";
+import { MongoClient, ObjectId } from "mongodb";
 import "dotenv/config";
 import dns from "node:dns";
 
@@ -16,8 +16,15 @@ import {
   APIError,
 } from "better-auth/api";
 
-// DNS configuration
+// ==========================================
+// DNS CONFIGURATION
+// ==========================================
+
 dns.setServers(["1.1.1.1", "8.8.8.8"]);
+
+// ==========================================
+// EXPRESS CONFIGURATION
+// ==========================================
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -25,7 +32,10 @@ const PORT = process.env.PORT || 5000;
 const CLIENT_URL =
   process.env.CLIENT_URL || "http://localhost:3000";
 
-// Environment validation
+// ==========================================
+// ENVIRONMENT VALIDATION
+// ==========================================
+
 const requiredEnv = [
   "MONGODB_URI",
   "BETTER_AUTH_SECRET",
@@ -40,18 +50,32 @@ for (const key of requiredEnv) {
   }
 }
 
-// CORS configuration
+// ==========================================
+// CORS CONFIGURATION
+// ==========================================
+
 app.use(
   cors({
     origin: CLIENT_URL,
     credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    methods: [
+      "GET",
+      "POST",
+      "PUT",
+      "PATCH",
+      "DELETE",
+      "OPTIONS",
+    ],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
-// MongoDB configuration
+// ==========================================
+// MONGODB CONFIGURATION
+// ==========================================
+
 const client = new MongoClient(process.env.MONGODB_URI);
+
 const db = client.db(process.env.DB_NAME || "fixmate");
 
 // Application collections
@@ -60,7 +84,10 @@ const serviceCollection = db.collection("services");
 const bookingCollection = db.collection("bookings");
 const paymentCollection = db.collection("payments");
 
-// Better Auth configuration
+// ==========================================
+// BETTER AUTH CONFIGURATION
+// ==========================================
+
 const auth = betterAuth({
   appName: "FixMate",
 
@@ -163,14 +190,23 @@ const auth = betterAuth({
   },
 });
 
-// Better Auth route
+// ==========================================
+// BETTER AUTH ROUTE
 // Keep this before express.json()
+// ==========================================
+
 app.all("/api/auth/*splat", toNodeHandler(auth));
 
-// Express body parser
+// ==========================================
+// EXPRESS BODY PARSER
+// ==========================================
+
 app.use(express.json());
 
-// Get authenticated user
+// ==========================================
+// AUTHENTICATED USER HELPER
+// ==========================================
+
 async function getAuthenticatedUser(req) {
   const session = await auth.api.getSession({
     headers: fromNodeHeaders(req.headers),
@@ -180,7 +216,7 @@ async function getAuthenticatedUser(req) {
     return null;
   }
 
-  // Read the latest user data from MongoDB
+  // Read latest user information from MongoDB
   const user = await userCollection.findOne({
     email: session.user.email,
   });
@@ -188,7 +224,55 @@ async function getAuthenticatedUser(req) {
   return user;
 }
 
-// Complete signup role selection
+// ==========================================
+// SERVICE CONFIGURATION
+// ==========================================
+
+const allowedCategories = [
+  "Smartphone",
+  "Laptop & PC",
+  "AC",
+  "Refrigerator",
+  "TV",
+  "Washing Machine",
+  "Electrical",
+];
+
+const allowedServiceModes = [
+  "Home Visit",
+  "Shop Drop-off",
+];
+
+// ==========================================
+// SERVICE VALIDATION HELPER
+// ==========================================
+
+function isValidImageUrl(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    return false;
+  }
+
+  try {
+    const imageUrl = new URL(value.trim());
+    const hostname = imageUrl.hostname.toLowerCase();
+
+    const isImgBB =
+      hostname === "ibb.co" ||
+      hostname.endsWith(".ibb.co") ||
+      hostname === "imgbb.com" ||
+      hostname.endsWith(".imgbb.com");
+
+    return imageUrl.protocol === "https:" && isImgBB;
+  } catch {
+    return false;
+  }
+}
+
+// ==========================================
+// COMPLETE SIGNUP ROLE SELECTION
+// POST /api/complete-signup-role
+// ==========================================
+
 app.post("/api/complete-signup-role", async (req, res) => {
   try {
     if (req.headers.origin !== CLIENT_URL) {
@@ -256,32 +340,12 @@ app.post("/api/complete-signup-role", async (req, res) => {
 });
 
 // ==========================================
-// SERVICE CONFIGURATION
-// ==========================================
-
-const allowedCategories = [
-  "Smartphone",
-  "Laptop & PC",
-  "AC",
-  "Refrigerator",
-  "TV",
-  "Washing Machine",
-  "Electrical",
-];
-
-const allowedServiceModes = [
-  "Home Visit",
-  "Shop Drop-off",
-];
-
-// ==========================================
 // TECHNICIAN: ADD NEW SERVICE
 // POST /api/services
 // ==========================================
 
 app.post("/api/services", async (req, res) => {
   try {
-    // Verify login
     const user = await getAuthenticatedUser(req);
 
     if (!user) {
@@ -291,7 +355,6 @@ app.post("/api/services", async (req, res) => {
       });
     }
 
-    // Only technicians can add services
     if (user.role !== "technician") {
       return res.status(403).json({
         success: false,
@@ -310,16 +373,20 @@ app.post("/api/services", async (req, res) => {
       image,
     } = req.body || {};
 
-    // Required field validation
     if (
-      !title?.trim() ||
-      !category ||
-      !description?.trim() ||
+      typeof title !== "string" ||
+      !title.trim() ||
+      typeof category !== "string" ||
+      typeof description !== "string" ||
+      !description.trim() ||
       basePrice === undefined ||
-      !estimatedDuration?.trim() ||
-      !serviceMode ||
-      !serviceArea?.trim() ||
-      !image?.trim()
+      typeof estimatedDuration !== "string" ||
+      !estimatedDuration.trim() ||
+      typeof serviceMode !== "string" ||
+      typeof serviceArea !== "string" ||
+      !serviceArea.trim() ||
+      typeof image !== "string" ||
+      !image.trim()
     ) {
       return res.status(400).json({
         success: false,
@@ -327,7 +394,6 @@ app.post("/api/services", async (req, res) => {
       });
     }
 
-    // Category validation
     if (!allowedCategories.includes(category)) {
       return res.status(400).json({
         success: false,
@@ -335,7 +401,6 @@ app.post("/api/services", async (req, res) => {
       });
     }
 
-    // Service mode validation
     if (!allowedServiceModes.includes(serviceMode)) {
       return res.status(400).json({
         success: false,
@@ -343,7 +408,6 @@ app.post("/api/services", async (req, res) => {
       });
     }
 
-    // Price validation
     const price = Number(basePrice);
 
     if (!Number.isFinite(price) || price <= 0) {
@@ -353,49 +417,26 @@ app.post("/api/services", async (req, res) => {
       });
     }
 
-    // Validate ImgBB image URL
-    let imageUrl;
-
-    try {
-      imageUrl = new URL(image.trim());
-
-      const hostname = imageUrl.hostname.toLowerCase();
-
-      const isImgBB =
-        hostname === "ibb.co" ||
-        hostname.endsWith(".ibb.co") ||
-        hostname === "imgbb.com" ||
-        hostname.endsWith(".imgbb.com");
-
-      if (imageUrl.protocol !== "https:" || !isImgBB) {
-        return res.status(400).json({
-          success: false,
-          message: "Please provide a valid ImgBB image URL.",
-        });
-      }
-    } catch {
+    if (!isValidImageUrl(image)) {
       return res.status(400).json({
         success: false,
-        message: "Invalid service image URL.",
+        message: "Please provide a valid ImgBB image URL.",
       });
     }
 
-    // Create service document
     const newService = {
       title: title.trim(),
       category,
       description: description.trim(),
-      image: imageUrl.href,
+      image: image.trim(),
       basePrice: price,
       estimatedDuration: estimatedDuration.trim(),
       serviceMode,
       serviceArea: serviceArea.trim(),
 
-      // Taken from authenticated database user
       technicianName: user.name,
       technicianEmail: user.email,
 
-      // New services must wait for admin approval
       approvalStatus: "pending",
       isAvailable: true,
 
@@ -431,7 +472,6 @@ app.post("/api/services", async (req, res) => {
 
 app.get("/api/services/my-services", async (req, res) => {
   try {
-    // Verify login
     const user = await getAuthenticatedUser(req);
 
     if (!user) {
@@ -441,7 +481,6 @@ app.get("/api/services/my-services", async (req, res) => {
       });
     }
 
-    // Only technicians can access this route
     if (user.role !== "technician") {
       return res.status(403).json({
         success: false,
@@ -449,7 +488,6 @@ app.get("/api/services/my-services", async (req, res) => {
       });
     }
 
-    // Find services belonging to logged-in technician
     const services = await serviceCollection
       .find({
         technicianEmail: user.email,
@@ -469,6 +507,287 @@ app.get("/api/services/my-services", async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to fetch your services.",
+    });
+  }
+});
+
+// ==========================================
+// TECHNICIAN: UPDATE SERVICE
+// PUT /api/services/:id
+// ==========================================
+
+app.put("/api/services/:id", async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Please login first.",
+      });
+    }
+
+    if (user.role !== "technician") {
+      return res.status(403).json({
+        success: false,
+        message: "Only technicians can update services.",
+      });
+    }
+
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid service ID.",
+      });
+    }
+
+    const {
+      title,
+      category,
+      description,
+      image,
+      basePrice,
+      estimatedDuration,
+      serviceMode,
+      serviceArea,
+    } = req.body || {};
+
+    if (
+      typeof title !== "string" ||
+      !title.trim() ||
+      typeof category !== "string" ||
+      typeof description !== "string" ||
+      !description.trim() ||
+      typeof image !== "string" ||
+      !image.trim() ||
+      typeof estimatedDuration !== "string" ||
+      !estimatedDuration.trim() ||
+      typeof serviceMode !== "string" ||
+      typeof serviceArea !== "string" ||
+      !serviceArea.trim()
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide all required service information.",
+      });
+    }
+
+    if (!allowedCategories.includes(category)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid service category.",
+      });
+    }
+
+    if (!allowedServiceModes.includes(serviceMode)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid service mode.",
+      });
+    }
+
+    const price = Number(basePrice);
+
+    if (!Number.isFinite(price) || price <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Base price must be a positive number.",
+      });
+    }
+
+    if (!isValidImageUrl(image)) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide a valid ImgBB image URL.",
+      });
+    }
+
+    const filter = {
+      _id: new ObjectId(id),
+      technicianEmail: user.email,
+    };
+
+    const updatedService = {
+      title: title.trim(),
+      category,
+      description: description.trim(),
+      image: image.trim(),
+      basePrice: price,
+      estimatedDuration: estimatedDuration.trim(),
+      serviceMode,
+      serviceArea: serviceArea.trim(),
+
+      // Edited services must be approved again
+      approvalStatus: "pending",
+
+      updatedAt: new Date(),
+    };
+
+    const result = await serviceCollection.updateOne(
+      filter,
+      {
+        $set: updatedService,
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found or you do not own this service.",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message:
+        "Service updated successfully. Waiting for admin approval.",
+    });
+  } catch (error) {
+    console.error("Update service error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update service.",
+    });
+  }
+});
+
+// ==========================================
+// TECHNICIAN: TOGGLE SERVICE AVAILABILITY
+// PATCH /api/services/:id/availability
+// ==========================================
+
+app.patch(
+  "/api/services/:id/availability",
+  async (req, res) => {
+    try {
+      const user = await getAuthenticatedUser(req);
+
+      if (!user) {
+        return res.status(401).json({
+          success: false,
+          message: "Please login first.",
+        });
+      }
+
+      if (user.role !== "technician") {
+        return res.status(403).json({
+          success: false,
+          message: "Only technicians can change availability.",
+        });
+      }
+
+      const { id } = req.params;
+      const { isAvailable } = req.body || {};
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid service ID.",
+        });
+      }
+
+      if (typeof isAvailable !== "boolean") {
+        return res.status(400).json({
+          success: false,
+          message: "isAvailable must be true or false.",
+        });
+      }
+
+      const result = await serviceCollection.updateOne(
+        {
+          _id: new ObjectId(id),
+          technicianEmail: user.email,
+        },
+        {
+          $set: {
+            isAvailable,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      if (result.matchedCount === 0) {
+        return res.status(404).json({
+          success: false,
+          message: "Service not found or you do not own this service.",
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: `Service is now ${
+          isAvailable ? "available" : "unavailable"
+        }.`,
+        isAvailable,
+      });
+    } catch (error) {
+      console.error("Availability update error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to update availability.",
+      });
+    }
+  }
+);
+
+// ==========================================
+// TECHNICIAN: DELETE SERVICE
+// DELETE /api/services/:id
+// ==========================================
+
+app.delete("/api/services/:id", async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Please login first.",
+      });
+    }
+
+    if (user.role !== "technician") {
+      return res.status(403).json({
+        success: false,
+        message: "Only technicians can delete services.",
+      });
+    }
+
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid service ID.",
+      });
+    }
+
+    const result = await serviceCollection.deleteOne({
+      _id: new ObjectId(id),
+      technicianEmail: user.email,
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found or you do not own this service.",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Service deleted successfully.",
+    });
+  } catch (error) {
+    console.error("Delete service error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to delete service.",
     });
   }
 });
@@ -520,6 +839,9 @@ async function run() {
       console.log("Secure role selection API is configured!");
       console.log("Technician Add Service API is configured!");
       console.log("Technician My Services API is configured!");
+      console.log("Technician Update Service API is configured!");
+      console.log("Technician Availability API is configured!");
+      console.log("Technician Delete Service API is configured!");
     });
   } catch (error) {
     console.error("Server startup failed:", error);
@@ -530,6 +852,7 @@ async function run() {
 run();
 
 export default app;
+
 
 
 
