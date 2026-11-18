@@ -256,8 +256,7 @@ app.post("/api/complete-signup-role", async (req, res) => {
 });
 
 // ==========================================
-// TECHNICIAN: ADD NEW SERVICE
-// POST /api/services
+// SERVICE CONFIGURATION
 // ==========================================
 
 const allowedCategories = [
@@ -274,6 +273,11 @@ const allowedServiceModes = [
   "Home Visit",
   "Shop Drop-off",
 ];
+
+// ==========================================
+// TECHNICIAN: ADD NEW SERVICE
+// POST /api/services
+// ==========================================
 
 app.post("/api/services", async (req, res) => {
   try {
@@ -387,7 +391,7 @@ app.post("/api/services", async (req, res) => {
       serviceMode,
       serviceArea: serviceArea.trim(),
 
-      // Taken from the authenticated database user
+      // Taken from authenticated database user
       technicianName: user.name,
       technicianEmail: user.email,
 
@@ -402,7 +406,8 @@ app.post("/api/services", async (req, res) => {
 
     return res.status(201).json({
       success: true,
-      message: "Service added successfully. Waiting for admin approval.",
+      message:
+        "Service added successfully. Waiting for admin approval.",
       insertedId: result.insertedId,
       service: {
         ...newService,
@@ -419,7 +424,59 @@ app.post("/api/services", async (req, res) => {
   }
 });
 
-// Root API
+// ==========================================
+// TECHNICIAN: GET MY SERVICES
+// GET /api/services/my-services
+// ==========================================
+
+app.get("/api/services/my-services", async (req, res) => {
+  try {
+    // Verify login
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in first.",
+      });
+    }
+
+    // Only technicians can access this route
+    if (user.role !== "technician") {
+      return res.status(403).json({
+        success: false,
+        message: "Only technicians can access their services.",
+      });
+    }
+
+    // Find services belonging to logged-in technician
+    const services = await serviceCollection
+      .find({
+        technicianEmail: user.email,
+      })
+      .sort({
+        createdAt: -1,
+      })
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      services,
+    });
+  } catch (error) {
+    console.error("Get my services error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch your services.",
+    });
+  }
+});
+
+// ==========================================
+// ROOT API
+// ==========================================
+
 app.get("/", (req, res) => {
   res.status(200).json({
     success: true,
@@ -427,7 +484,10 @@ app.get("/", (req, res) => {
   });
 });
 
-// Health check API
+// ==========================================
+// HEALTH CHECK API
+// ==========================================
+
 app.get("/api/health", (req, res) => {
   res.status(200).json({
     success: true,
@@ -442,7 +502,10 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Start server
+// ==========================================
+// START SERVER
+// ==========================================
+
 async function run() {
   try {
     await client.connect();
@@ -456,6 +519,7 @@ async function run() {
       console.log("Google Authentication is configured!");
       console.log("Secure role selection API is configured!");
       console.log("Technician Add Service API is configured!");
+      console.log("Technician My Services API is configured!");
     });
   } catch (error) {
     console.error("Server startup failed:", error);
