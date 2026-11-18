@@ -774,6 +774,135 @@ app.get("/api/bookings/my-bookings", async (req, res) => {
   }
 });
 
+
+
+
+// ==========================================
+// TECHNICIAN: GET MY REPAIR REQUESTS
+// GET /api/bookings/technician-requests
+// ==========================================
+
+app.get("/api/bookings/technician-requests", async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in first.",
+      });
+    }
+
+    if (user.role !== "technician") {
+      return res.status(403).json({
+        success: false,
+        message: "Only technicians can view repair requests.",
+      });
+    }
+
+    const bookings = await bookingCollection
+      .find({
+        technicianEmail: user.email,
+      })
+      .sort({
+        createdAt: -1,
+      })
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      message: "Repair requests fetched successfully.",
+      bookings,
+    });
+  } catch (error) {
+    console.error("Get technician requests error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch repair requests.",
+    });
+  }
+});
+
+
+// ==========================================
+// TECHNICIAN: ACCEPT OR REJECT BOOKING
+// PATCH /api/bookings/:id/status
+// ==========================================
+
+app.patch("/api/bookings/:id/status", async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in first.",
+      });
+    }
+
+    if (user.role !== "technician") {
+      return res.status(403).json({
+        success: false,
+        message: "Only technicians can update booking requests.",
+      });
+    }
+
+    const { id } = req.params;
+    const { status } = req.body || {};
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid booking ID.",
+      });
+    }
+
+    if (!["accepted", "rejected"].includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: "Status must be accepted or rejected.",
+      });
+    }
+
+    const result = await bookingCollection.updateOne(
+      {
+        _id: new ObjectId(id),
+        technicianEmail: user.email,
+        status: "requested",
+      },
+      {
+        $set: {
+          status,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message:
+          "Booking not found, already processed, or you do not have permission.",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Booking ${status} successfully.`,
+    });
+  } catch (error) {
+    console.error("Update booking status error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update booking status.",
+    });
+  }
+});
+
+
+
 // ==========================================
 // TECHNICIAN: UPDATE SERVICE
 // PUT /api/services/:id
