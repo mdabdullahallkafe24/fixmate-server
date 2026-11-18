@@ -90,11 +90,8 @@ const paymentCollection = db.collection("payments");
 
 const auth = betterAuth({
   appName: "FixMate",
-
   baseURL: process.env.BETTER_AUTH_URL,
-
   secret: process.env.BETTER_AUTH_SECRET,
-
   trustedOrigins: [CLIENT_URL],
 
   database: mongodbAdapter(db, {
@@ -590,7 +587,6 @@ app.get("/api/services/:id", async (req, res) => {
 
 app.post("/api/bookings", async (req, res) => {
   try {
-    // Check logged-in user
     const user = await getAuthenticatedUser(req);
 
     if (!user) {
@@ -600,7 +596,6 @@ app.post("/api/bookings", async (req, res) => {
       });
     }
 
-    // Only customers can create bookings
     if (user.role !== "customer") {
       return res.status(403).json({
         success: false,
@@ -616,7 +611,6 @@ app.post("/api/bookings", async (req, res) => {
       problemDescription,
     } = req.body || {};
 
-    // Validate service ID
     if (
       typeof serviceId !== "string" ||
       !ObjectId.isValid(serviceId)
@@ -627,7 +621,6 @@ app.post("/api/bookings", async (req, res) => {
       });
     }
 
-    // Validate required fields
     if (
       typeof phone !== "string" ||
       !phone.trim() ||
@@ -643,7 +636,6 @@ app.post("/api/bookings", async (req, res) => {
       });
     }
 
-    // Validate phone number
     const cleanPhone = phone.trim();
 
     if (cleanPhone.length < 7 || cleanPhone.length > 20) {
@@ -653,7 +645,6 @@ app.post("/api/bookings", async (req, res) => {
       });
     }
 
-    // Validate date format and actual calendar date
     const datePattern = /^\d{4}-\d{2}-\d{2}$/;
 
     if (!datePattern.test(preferredDate)) {
@@ -677,7 +668,6 @@ app.post("/api/bookings", async (req, res) => {
       });
     }
 
-    // Find the requested service
     const service = await serviceCollection.findOne({
       _id: new ObjectId(serviceId),
       approvalStatus: "approved",
@@ -691,7 +681,6 @@ app.post("/api/bookings", async (req, res) => {
       });
     }
 
-    // Create booking using trusted database and user information
     const newBooking = {
       serviceId: service._id,
       serviceTitle: service.title,
@@ -734,6 +723,53 @@ app.post("/api/bookings", async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to create booking. Please try again.",
+    });
+  }
+});
+
+// ==========================================
+// CUSTOMER: GET MY BOOKINGS
+// GET /api/bookings/my-bookings
+// ==========================================
+
+app.get("/api/bookings/my-bookings", async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in to view your bookings.",
+      });
+    }
+
+    if (user.role !== "customer") {
+      return res.status(403).json({
+        success: false,
+        message: "Only customers can access their bookings.",
+      });
+    }
+
+    const bookings = await bookingCollection
+      .find({
+        customerEmail: user.email,
+      })
+      .sort({
+        createdAt: -1,
+      })
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      message: "Your bookings fetched successfully.",
+      bookings,
+    });
+  } catch (error) {
+    console.error("Get my bookings error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch your bookings.",
     });
   }
 });
@@ -1194,6 +1230,7 @@ async function run() {
       console.log("Technician Delete Service API is configured!");
 
       console.log("Customer Create Booking API is configured!");
+      console.log("Customer My Bookings API is configured!");
 
       console.log("Admin Get All Services API is configured!");
       console.log("Admin Approve/Reject Service API is configured!");
