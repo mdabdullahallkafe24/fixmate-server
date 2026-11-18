@@ -774,9 +774,6 @@ app.get("/api/bookings/my-bookings", async (req, res) => {
   }
 });
 
-
-
-
 // ==========================================
 // TECHNICIAN: GET MY REPAIR REQUESTS
 // GET /api/bookings/technician-requests
@@ -824,9 +821,8 @@ app.get("/api/bookings/technician-requests", async (req, res) => {
   }
 });
 
-
 // ==========================================
-// TECHNICIAN: ACCEPT OR REJECT BOOKING
+// TECHNICIAN: UPDATE BOOKING STATUS
 // PATCH /api/bookings/:id/status
 // ==========================================
 
@@ -844,7 +840,7 @@ app.patch("/api/bookings/:id/status", async (req, res) => {
     if (user.role !== "technician") {
       return res.status(403).json({
         success: false,
-        message: "Only technicians can update booking requests.",
+        message: "Only technicians can update booking status.",
       });
     }
 
@@ -858,38 +854,90 @@ app.patch("/api/bookings/:id/status", async (req, res) => {
       });
     }
 
-    if (!["accepted", "rejected"].includes(status)) {
+    const validStatuses = [
+      "accepted",
+      "rejected",
+      "in-progress",
+      "completed",
+    ];
+
+    if (!validStatuses.includes(status)) {
       return res.status(400).json({
         success: false,
-        message: "Status must be accepted or rejected.",
+        message: "Invalid booking status.",
       });
     }
 
+    // Allowed status transitions
+    const allowedTransitions = {
+      requested: ["accepted", "rejected"],
+      accepted: ["in-progress"],
+      "in-progress": ["completed"],
+    };
+
+    const bookingId = new ObjectId(id);
+
+    // Verify booking ownership
+    const booking = await bookingCollection.findOne({
+      _id: bookingId,
+      technicianEmail: user.email,
+    });
+
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        message: "Booking not found or you do not have permission.",
+      });
+    }
+
+    // Verify the requested transition
+    const allowedNextStatuses =
+      allowedTransitions[booking.status] || [];
+
+    if (!allowedNextStatuses.includes(status)) {
+      return res.status(409).json({
+        success: false,
+        message: `Cannot change booking status from ${booking.status} to ${status}.`,
+        currentStatus: booking.status,
+      });
+    }
+
+    const now = new Date();
+
+    const updateFields = {
+      status,
+      updatedAt: now,
+    };
+
+    if (status === "completed") {
+      updateFields.completedAt = now;
+    }
+
+    // Atomic update protects against duplicate requests
     const result = await bookingCollection.updateOne(
       {
-        _id: new ObjectId(id),
+        _id: bookingId,
         technicianEmail: user.email,
-        status: "requested",
+        status: booking.status,
       },
       {
-        $set: {
-          status,
-          updatedAt: new Date(),
-        },
+        $set: updateFields,
       }
     );
 
     if (result.matchedCount === 0) {
-      return res.status(404).json({
+      return res.status(409).json({
         success: false,
-        message:
-          "Booking not found, already processed, or you do not have permission.",
+        message: "This request has already been processed. Please refresh.",
       });
     }
 
     return res.status(200).json({
       success: true,
-      message: `Booking ${status} successfully.`,
+      message: `Booking status updated to ${status} successfully.`,
+      status,
+      completedAt:
+        status === "completed" ? now : null,
     });
   } catch (error) {
     console.error("Update booking status error:", error);
@@ -900,8 +948,6 @@ app.patch("/api/bookings/:id/status", async (req, res) => {
     });
   }
 });
-
-
 
 // ==========================================
 // TECHNICIAN: UPDATE SERVICE
@@ -1361,6 +1407,9 @@ async function run() {
       console.log("Customer Create Booking API is configured!");
       console.log("Customer My Bookings API is configured!");
 
+      console.log("Technician Repair Requests API is configured!");
+      console.log("Technician Booking Status Workflow is configured!");
+
       console.log("Admin Get All Services API is configured!");
       console.log("Admin Approve/Reject Service API is configured!");
     });
@@ -1373,3 +1422,4 @@ async function run() {
 run();
 
 export default app;
+
