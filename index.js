@@ -584,6 +584,161 @@ app.get("/api/services/:id", async (req, res) => {
 });
 
 // ==========================================
+// CUSTOMER: CREATE NEW BOOKING
+// POST /api/bookings
+// ==========================================
+
+app.post("/api/bookings", async (req, res) => {
+  try {
+    // Check logged-in user
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in to book a service.",
+      });
+    }
+
+    // Only customers can create bookings
+    if (user.role !== "customer") {
+      return res.status(403).json({
+        success: false,
+        message: "Only customers can book a service.",
+      });
+    }
+
+    const {
+      serviceId,
+      phone,
+      address,
+      preferredDate,
+      problemDescription,
+    } = req.body || {};
+
+    // Validate service ID
+    if (
+      typeof serviceId !== "string" ||
+      !ObjectId.isValid(serviceId)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide a valid service ID.",
+      });
+    }
+
+    // Validate required fields
+    if (
+      typeof phone !== "string" ||
+      !phone.trim() ||
+      typeof address !== "string" ||
+      !address.trim() ||
+      typeof preferredDate !== "string" ||
+      typeof problemDescription !== "string" ||
+      !problemDescription.trim()
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide all required booking information.",
+      });
+    }
+
+    // Validate phone number
+    const cleanPhone = phone.trim();
+
+    if (cleanPhone.length < 7 || cleanPhone.length > 20) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide a valid phone number.",
+      });
+    }
+
+    // Validate date format and actual calendar date
+    const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+
+    if (!datePattern.test(preferredDate)) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide a valid preferred date.",
+      });
+    }
+
+    const parsedDate = new Date(
+      `${preferredDate}T00:00:00.000Z`
+    );
+
+    if (
+      Number.isNaN(parsedDate.getTime()) ||
+      parsedDate.toISOString().slice(0, 10) !== preferredDate
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide a valid calendar date.",
+      });
+    }
+
+    // Find the requested service
+    const service = await serviceCollection.findOne({
+      _id: new ObjectId(serviceId),
+      approvalStatus: "approved",
+      isAvailable: true,
+    });
+
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        message: "This service is not available for booking.",
+      });
+    }
+
+    // Create booking using trusted database and user information
+    const newBooking = {
+      serviceId: service._id,
+      serviceTitle: service.title,
+      serviceImage: service.image,
+      category: service.category,
+      basePrice: service.basePrice,
+
+      technicianName: service.technicianName,
+      technicianEmail: service.technicianEmail,
+
+      customerName: user.name,
+      customerEmail: user.email,
+      customerPhone: cleanPhone,
+
+      address: address.trim(),
+      preferredDate,
+      problemDescription: problemDescription.trim(),
+
+      status: "requested",
+      finalAmount: null,
+      paymentStatus: "unpaid",
+
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await bookingCollection.insertOne(newBooking);
+
+    return res.status(201).json({
+      success: true,
+      message: "Your service booking has been submitted successfully.",
+      booking: {
+        ...newBooking,
+        _id: result.insertedId,
+      },
+    });
+  } catch (error) {
+    console.error("Create booking error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to create booking. Please try again.",
+    });
+  }
+});
+
+// ==========================================
 // TECHNICIAN: UPDATE SERVICE
 // PUT /api/services/:id
 // ==========================================
@@ -1037,6 +1192,8 @@ async function run() {
       console.log("Technician Update Service API is configured!");
       console.log("Technician Availability API is configured!");
       console.log("Technician Delete Service API is configured!");
+
+      console.log("Customer Create Booking API is configured!");
 
       console.log("Admin Get All Services API is configured!");
       console.log("Admin Approve/Reject Service API is configured!");
