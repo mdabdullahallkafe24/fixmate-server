@@ -336,6 +336,38 @@ app.post("/api/complete-signup-role", async (req, res) => {
 });
 
 // ==========================================
+// PUBLIC: GET APPROVED AND AVAILABLE SERVICES
+// GET /api/services
+// ==========================================
+
+app.get("/api/services", async (req, res) => {
+  try {
+    const services = await serviceCollection
+      .find({
+        approvalStatus: "approved",
+        isAvailable: true,
+      })
+      .sort({
+        createdAt: -1,
+      })
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      message: "Available services fetched successfully.",
+      services,
+    });
+  } catch (error) {
+    console.error("Public get services error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch available services.",
+    });
+  }
+});
+
+// ==========================================
 // TECHNICIAN: ADD NEW SERVICE
 // POST /api/services
 // ==========================================
@@ -952,6 +984,8 @@ async function run() {
       console.log("Better Auth is configured!");
       console.log("Google Authentication is configured!");
       console.log("Secure role selection API is configured!");
+
+      console.log("Public Get Approved Services API is configured!");
 
       console.log("Technician Add Service API is configured!");
       console.log("Technician My Services API is configured!");
