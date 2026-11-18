@@ -52,7 +52,6 @@ app.use(
 
 // MongoDB configuration
 const client = new MongoClient(process.env.MONGODB_URI);
-
 const db = client.db(process.env.DB_NAME || "fixmate");
 
 // Application collections
@@ -94,7 +93,6 @@ const auth = betterAuth({
     modelName: "users",
 
     additionalFields: {
-      // Role is controlled by the backend only
       role: {
         type: "string",
         required: false,
@@ -102,7 +100,6 @@ const auth = betterAuth({
         input: false,
       },
 
-      // Only newly created accounts can complete role selection
       roleSelectionPending: {
         type: "boolean",
         required: false,
@@ -156,11 +153,7 @@ const auth = betterAuth({
           return {
             data: {
               ...user,
-
-              // Public signup can NEVER create an admin
               role: "customer",
-
-              // Allow one-time customer/technician selection
               roleSelectionPending: true,
             },
           };
@@ -171,16 +164,33 @@ const auth = betterAuth({
 });
 
 // Better Auth route
-// IMPORTANT: Keep this before express.json()
+// Keep this before express.json()
 app.all("/api/auth/*splat", toNodeHandler(auth));
 
 // Express body parser
 app.use(express.json());
 
+// Get authenticated user
+async function getAuthenticatedUser(req) {
+  const session = await auth.api.getSession({
+    headers: fromNodeHeaders(req.headers),
+  });
+
+  if (!session?.user?.email) {
+    return null;
+  }
+
+  // Read the latest user data from MongoDB
+  const user = await userCollection.findOne({
+    email: session.user.email,
+  });
+
+  return user;
+}
+
 // Complete signup role selection
 app.post("/api/complete-signup-role", async (req, res) => {
   try {
-    // Check frontend origin
     if (req.headers.origin !== CLIENT_URL) {
       return res.status(403).json({
         success: false,
@@ -190,7 +200,6 @@ app.post("/api/complete-signup-role", async (req, res) => {
 
     const { role } = req.body || {};
 
-    // Only customer and technician are allowed
     if (!["customer", "technician"].includes(role)) {
       return res.status(400).json({
         success: false,
@@ -198,7 +207,6 @@ app.post("/api/complete-signup-role", async (req, res) => {
       });
     }
 
-    // Verify authenticated user session
     const session = await auth.api.getSession({
       headers: fromNodeHeaders(req.headers),
     });
@@ -210,7 +218,6 @@ app.post("/api/complete-signup-role", async (req, res) => {
       });
     }
 
-    // Update only accounts that are awaiting role selection
     const result = await userCollection.updateOne(
       {
         email: session.user.email,
@@ -244,6 +251,170 @@ app.post("/api/complete-signup-role", async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Unable to complete account role selection.",
+    });
+  }
+});
+
+// ==========================================
+// TECHNICIAN: ADD NEW SERVICE
+// POST /api/services
+// ==========================================
+
+const allowedCategories = [
+  "Smartphone",
+  "Laptop & PC",
+  "AC",
+  "Refrigerator",
+  "TV",
+  "Washing Machine",
+  "Electrical",
+];
+
+const allowedServiceModes = [
+  "Home Visit",
+  "Shop Drop-off",
+];
+
+app.post("/api/services", async (req, res) => {
+  try {
+    // Verify login
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in to add a service.",
+      });
+    }
+
+    // Only technicians can add services
+    if (user.role !== "technician") {
+      return res.status(403).json({
+        success: false,
+        message: "Only technicians can add services.",
+      });
+    }
+
+    const {
+      title,
+      category,
+      description,
+      basePrice,
+      estimatedDuration,
+      serviceMode,
+      serviceArea,
+      image,
+    } = req.body || {};
+
+    // Required field validation
+    if (
+      !title?.trim() ||
+      !category ||
+      !description?.trim() ||
+      basePrice === undefined ||
+      !estimatedDuration?.trim() ||
+      !serviceMode ||
+      !serviceArea?.trim() ||
+      !image?.trim()
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide all required service information.",
+      });
+    }
+
+    // Category validation
+    if (!allowedCategories.includes(category)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid service category.",
+      });
+    }
+
+    // Service mode validation
+    if (!allowedServiceModes.includes(serviceMode)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid service mode.",
+      });
+    }
+
+    // Price validation
+    const price = Number(basePrice);
+
+    if (!Number.isFinite(price) || price <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Base price must be a positive number.",
+      });
+    }
+
+    // Validate ImgBB image URL
+    let imageUrl;
+
+    try {
+      imageUrl = new URL(image.trim());
+
+      const hostname = imageUrl.hostname.toLowerCase();
+
+      const isImgBB =
+        hostname === "ibb.co" ||
+        hostname.endsWith(".ibb.co") ||
+        hostname === "imgbb.com" ||
+        hostname.endsWith(".imgbb.com");
+
+      if (imageUrl.protocol !== "https:" || !isImgBB) {
+        return res.status(400).json({
+          success: false,
+          message: "Please provide a valid ImgBB image URL.",
+        });
+      }
+    } catch {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid service image URL.",
+      });
+    }
+
+    // Create service document
+    const newService = {
+      title: title.trim(),
+      category,
+      description: description.trim(),
+      image: imageUrl.href,
+      basePrice: price,
+      estimatedDuration: estimatedDuration.trim(),
+      serviceMode,
+      serviceArea: serviceArea.trim(),
+
+      // Taken from the authenticated database user
+      technicianName: user.name,
+      technicianEmail: user.email,
+
+      // New services must wait for admin approval
+      approvalStatus: "pending",
+      isAvailable: true,
+
+      createdAt: new Date(),
+    };
+
+    const result = await serviceCollection.insertOne(newService);
+
+    return res.status(201).json({
+      success: true,
+      message: "Service added successfully. Waiting for admin approval.",
+      insertedId: result.insertedId,
+      service: {
+        ...newService,
+        _id: result.insertedId,
+      },
+    });
+  } catch (error) {
+    console.error("Add service error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to add service. Please try again.",
     });
   }
 });
@@ -284,6 +455,7 @@ async function run() {
       console.log("Better Auth is configured!");
       console.log("Google Authentication is configured!");
       console.log("Secure role selection API is configured!");
+      console.log("Technician Add Service API is configured!");
     });
   } catch (error) {
     console.error("Server startup failed:", error);
