@@ -78,7 +78,7 @@ const client = new MongoClient(process.env.MONGODB_URI);
 
 const db = client.db(process.env.DB_NAME || "fixmate");
 
-// Application collections
+// Exactly four application collections
 const userCollection = db.collection("users");
 const serviceCollection = db.collection("services");
 const bookingCollection = db.collection("bookings");
@@ -101,13 +101,11 @@ const auth = betterAuth({
     client,
   }),
 
-  // Email and Password Authentication
   emailAndPassword: {
     enabled: true,
     minPasswordLength: 6,
   },
 
-  // Google Authentication
   socialProviders: {
     google: {
       clientId: process.env.GOOGLE_CLIENT_ID,
@@ -115,7 +113,6 @@ const auth = betterAuth({
     },
   },
 
-  // User collection and additional fields
   user: {
     modelName: "users",
 
@@ -172,7 +169,7 @@ const auth = betterAuth({
     }),
   },
 
-  // Secure default role for every newly created account
+  // Secure default role for every new account
   databaseHooks: {
     user: {
       create: {
@@ -216,7 +213,6 @@ async function getAuthenticatedUser(req) {
     return null;
   }
 
-  // Read latest user information from MongoDB
   const user = await userCollection.findOne({
     email: session.user.email,
   });
@@ -244,7 +240,7 @@ const allowedServiceModes = [
 ];
 
 // ==========================================
-// SERVICE VALIDATION HELPER
+// SERVICE IMAGE VALIDATION
 // ==========================================
 
 function isValidImageUrl(value) {
@@ -619,7 +615,6 @@ app.put("/api/services/:id", async (req, res) => {
       serviceMode,
       serviceArea: serviceArea.trim(),
 
-      // Edited services must be approved again
       approvalStatus: "pending",
 
       updatedAt: new Date(),
@@ -793,6 +788,126 @@ app.delete("/api/services/:id", async (req, res) => {
 });
 
 // ==========================================
+// ADMIN: GET ALL SERVICES
+// GET /api/admin/services
+// ==========================================
+
+app.get("/api/admin/services", async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in first.",
+      });
+    }
+
+    if (user.role !== "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Admin access required.",
+      });
+    }
+
+    const services = await serviceCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      message: "Services fetched successfully.",
+      services,
+    });
+  } catch (error) {
+    console.error("Admin get services error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch services.",
+    });
+  }
+});
+
+// ==========================================
+// ADMIN: APPROVE OR REJECT SERVICE
+// PATCH /api/admin/services/:id/approval
+// ==========================================
+
+app.patch(
+  "/api/admin/services/:id/approval",
+  async (req, res) => {
+    try {
+      const user = await getAuthenticatedUser(req);
+
+      if (!user) {
+        return res.status(401).json({
+          success: false,
+          message: "Please sign in first.",
+        });
+      }
+
+      if (user.role !== "admin") {
+        return res.status(403).json({
+          success: false,
+          message: "Admin access required.",
+        });
+      }
+
+      const { id } = req.params;
+      const { approvalStatus } = req.body || {};
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid service ID.",
+        });
+      }
+
+      if (!["approved", "rejected"].includes(approvalStatus)) {
+        return res.status(400).json({
+          success: false,
+          message: "Status must be approved or rejected.",
+        });
+      }
+
+      const result = await serviceCollection.updateOne(
+        {
+          _id: new ObjectId(id),
+        },
+        {
+          $set: {
+            approvalStatus,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      if (result.matchedCount === 0) {
+        return res.status(404).json({
+          success: false,
+          message: "Service not found.",
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: `Service ${approvalStatus} successfully.`,
+        approvalStatus,
+      });
+    } catch (error) {
+      console.error("Admin approval error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to update service approval.",
+      });
+    }
+  }
+);
+
+// ==========================================
 // ROOT API
 // ==========================================
 
@@ -837,11 +952,15 @@ async function run() {
       console.log("Better Auth is configured!");
       console.log("Google Authentication is configured!");
       console.log("Secure role selection API is configured!");
+
       console.log("Technician Add Service API is configured!");
       console.log("Technician My Services API is configured!");
       console.log("Technician Update Service API is configured!");
       console.log("Technician Availability API is configured!");
       console.log("Technician Delete Service API is configured!");
+
+      console.log("Admin Get All Services API is configured!");
+      console.log("Admin Approve/Reject Service API is configured!");
     });
   } catch (error) {
     console.error("Server startup failed:", error);
