@@ -1,5 +1,6 @@
 
 import express from "express";
+import Stripe from "stripe";
 import cors from "cors";
 import { MongoClient, ObjectId } from "mongodb";
 import "dotenv/config";
@@ -42,6 +43,7 @@ const requiredEnv = [
   "GOOGLE_CLIENT_ID",
   "GOOGLE_CLIENT_SECRET",
   "BETTER_AUTH_URL",
+  "STRIPE_SECRET_KEY",
 ];
 
 for (const key of requiredEnv) {
@@ -49,6 +51,8 @@ for (const key of requiredEnv) {
     throw new Error(`${key} is missing from .env`);
   }
 }
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 // ==========================================
 // CORS CONFIGURATION
@@ -97,6 +101,12 @@ const auth = betterAuth({
   database: mongodbAdapter(db, {
     client,
   }),
+account: {
+  accountLinking: {
+    enabled: true,
+    trustedProviders: ["google"],
+  },
+},
 
   emailAndPassword: {
     enabled: true,
@@ -190,6 +200,176 @@ const auth = betterAuth({
 // ==========================================
 
 app.all("/api/auth/*splat", toNodeHandler(auth));
+
+// ==========================================
+// STRIPE: RECORD SUCCESSFUL PAYMENT
+// =========================================
+
+
+async function recordSuccessfulPayment(session) {
+  if (session.payment_status !== "paid") {
+    throw new Error("Stripe payment is not completed.");
+  }
+
+  const bookingId = session.metadata?.bookingId;
+  const customerEmail = session.metadata?.customerEmail;
+
+  if (
+    !bookingId ||
+    !ObjectId.isValid(bookingId) ||
+    !customerEmail
+  ) {
+    throw new Error("Invalid Stripe session metadata.");
+  }
+
+  const booking = await bookingCollection.findOne({
+    _id: new ObjectId(bookingId),
+    customerEmail,
+    stripeSessionId: session.id,
+  });
+
+  if (!booking) {
+    throw new Error("Matching booking not found.");
+  }
+
+  const expectedAmount = Math.round(
+    Number(booking.finalAmount) * 100
+  );
+
+  if (
+    !Number.isFinite(expectedAmount) ||
+    session.amount_total !== expectedAmount
+  ) {
+    throw new Error("Payment amount mismatch.");
+  }
+
+  const expectedCurrency = (
+    process.env.STRIPE_CURRENCY || "bdt"
+  ).toLowerCase();
+
+  if (session.currency !== expectedCurrency) {
+    throw new Error("Payment currency mismatch.");
+  }
+
+  // Prevent duplicate payment records
+  const existingPayment = await paymentCollection.findOne({
+    stripeSessionId: session.id,
+  });
+
+  if (existingPayment?.status === "succeeded") {
+    await bookingCollection.updateOne(
+      { _id: booking._id },
+      {
+        $set: {
+          paymentStatus: "paid",
+          paymentIntentId: session.payment_intent,
+          paidAt: existingPayment.paidAt || new Date(),
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    return existingPayment;
+  }
+
+  const now = new Date();
+
+  await paymentCollection.updateOne(
+    { stripeSessionId: session.id },
+    {
+      $set: {
+        bookingId: booking._id,
+        customerEmail: booking.customerEmail,
+        technicianEmail: booking.technicianEmail,
+        amount: session.amount_total / 100,
+        currency: session.currency,
+        status: "succeeded",
+        transactionId: session.payment_intent,
+        paymentIntentId: session.payment_intent,
+        paidAt: now,
+        updatedAt: now,
+      },
+      $setOnInsert: {
+        createdAt: now,
+      },
+    },
+    { upsert: true }
+  );
+
+  await bookingCollection.updateOne(
+    {
+      _id: booking._id,
+      stripeSessionId: session.id,
+    },
+    {
+      $set: {
+        paymentStatus: "paid",
+        paymentIntentId: session.payment_intent,
+        paidAt: now,
+        updatedAt: now,
+      },
+    }
+  );
+
+  return { success: true };
+}
+
+
+
+// ==========================================
+// STRIPE WEBHOOK
+// POST /api/payments/webhook
+// Must be before express.json()
+// ==========================================
+
+app.post(
+  "/api/payments/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    if (!webhookSecret) {
+      return res.status(500).json({
+        success: false,
+        message: "Stripe webhook secret is not configured.",
+      });
+    }
+
+    let event;
+
+    try {
+      const signature = req.headers["stripe-signature"];
+
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        signature,
+        webhookSecret
+      );
+    } catch (error) {
+      console.error(
+        "Stripe webhook signature verification failed:",
+        error.message
+      );
+
+      return res.status(400).send(`Webhook Error: ${error.message}`);
+    }
+
+    try {
+      if (event.type === "checkout.session.completed") {
+        await recordSuccessfulPayment(event.data.object);
+      }
+
+      return res.status(200).json({ received: true });
+    } catch (error) {
+      console.error("Stripe webhook processing error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Stripe webhook processing failed.",
+      });
+    }
+  }
+);
 
 // ==========================================
 // EXPRESS BODY PARSER
@@ -489,6 +669,136 @@ app.post("/api/services", async (req, res) => {
     });
   }
 });
+
+
+
+
+// ==========================================
+// VERIFY STRIPE CHECKOUT PAYMENT
+// ==========================================
+
+app.post("/api/payments/verify-checkout-session", async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in to verify your payment.",
+      });
+    }
+
+    if (user.role !== "customer") {
+      return res.status(403).json({
+        success: false,
+        message: "Only customers can verify payments.",
+      });
+    }
+
+    const { sessionId } = req.body;
+
+    if (!sessionId || typeof sessionId !== "string") {
+      return res.status(400).json({
+        success: false,
+        message: "A valid Stripe session ID is required.",
+      });
+    }
+
+    // Retrieve the actual Checkout Session from Stripe
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+    if (session.payment_status !== "paid") {
+      return res.status(409).json({
+        success: false,
+        message: "Payment has not been completed yet.",
+        paymentStatus: session.payment_status,
+      });
+    }
+
+    const bookingId = session.metadata?.bookingId;
+    const customerEmail = session.metadata?.customerEmail;
+
+    // Verify session metadata
+    if (
+      !bookingId ||
+      !ObjectId.isValid(bookingId) ||
+      !customerEmail ||
+      customerEmail.toLowerCase() !== user.email.toLowerCase()
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "Payment session does not belong to this customer.",
+      });
+    }
+
+    // Find the booking belonging to the authenticated customer
+    const booking = await bookingCollection.findOne({
+      _id: new ObjectId(bookingId),
+      customerEmail: user.email,
+    });
+
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        message: "Associated booking was not found.",
+      });
+    }
+
+    // Make sure this Stripe session belongs to this booking
+    if (booking.stripeSessionId !== session.id) {
+      return res.status(403).json({
+        success: false,
+        message: "Stripe session does not match this booking.",
+      });
+    }
+
+    // Verify payment amount
+    const expectedAmount = Math.round(
+      Number(booking.finalAmount) * 100
+    );
+
+    if (
+      !Number.isFinite(expectedAmount) ||
+      session.amount_total !== expectedAmount
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment amount does not match the booking amount.",
+      });
+    }
+
+    // Verify currency
+    const expectedCurrency = (
+      process.env.STRIPE_CURRENCY || "bdt"
+    ).toLowerCase();
+
+    if (session.currency !== expectedCurrency) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment currency does not match.",
+      });
+    }
+
+    // Reuse the existing payment-saving logic
+    await recordSuccessfulPayment(session);
+
+    return res.status(200).json({
+      success: true,
+      message: "Payment verified successfully.",
+      paymentStatus: "paid",
+      bookingId,
+    });
+  } catch (error) {
+    console.error("Stripe payment verification error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to verify Stripe payment.",
+    });
+  }
+});
+
+
 
 // ==========================================
 // TECHNICIAN: GET MY SERVICES
@@ -845,7 +1155,7 @@ app.patch("/api/bookings/:id/status", async (req, res) => {
     }
 
     const { id } = req.params;
-    const { status } = req.body || {};
+    const { status, finalAmount } = req.body || {};
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({
@@ -858,6 +1168,7 @@ app.patch("/api/bookings/:id/status", async (req, res) => {
       "accepted",
       "rejected",
       "in-progress",
+      "awaiting-payment",
       "completed",
     ];
 
@@ -868,16 +1179,8 @@ app.patch("/api/bookings/:id/status", async (req, res) => {
       });
     }
 
-    // Allowed status transitions
-    const allowedTransitions = {
-      requested: ["accepted", "rejected"],
-      accepted: ["in-progress"],
-      "in-progress": ["completed"],
-    };
-
     const bookingId = new ObjectId(id);
 
-    // Verify booking ownership
     const booking = await bookingCollection.findOne({
       _id: bookingId,
       technicianEmail: user.email,
@@ -890,7 +1193,13 @@ app.patch("/api/bookings/:id/status", async (req, res) => {
       });
     }
 
-    // Verify the requested transition
+    const allowedTransitions = {
+      requested: ["accepted", "rejected"],
+      accepted: ["in-progress"],
+      "in-progress": ["awaiting-payment"],
+      "awaiting-payment": ["completed"],
+    };
+
     const allowedNextStatuses =
       allowedTransitions[booking.status] || [];
 
@@ -909,11 +1218,42 @@ app.patch("/api/bookings/:id/status", async (req, res) => {
       updatedAt: now,
     };
 
+    // Technician sends final amount to customer
+    if (status === "awaiting-payment") {
+      const amount = Number(finalAmount);
+
+      if (
+        finalAmount === undefined ||
+        finalAmount === null ||
+        finalAmount === "" ||
+        !Number.isFinite(amount) ||
+        amount <= 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Please provide a valid final amount.",
+        });
+      }
+
+      updateFields.finalAmount = amount;
+      updateFields.paymentStatus = "unpaid";
+      updateFields.amountRequestedAt = now;
+      updateFields.stripeSessionId = null;
+    }
+
+    // Technician can confirm only after successful payment
     if (status === "completed") {
+      if (booking.paymentStatus !== "paid") {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Customer must complete payment before you confirm this repair.",
+        });
+      }
+
       updateFields.completedAt = now;
     }
 
-    // Atomic update protects against duplicate requests
     const result = await bookingCollection.updateOne(
       {
         _id: bookingId,
@@ -928,16 +1268,29 @@ app.patch("/api/bookings/:id/status", async (req, res) => {
     if (result.matchedCount === 0) {
       return res.status(409).json({
         success: false,
-        message: "This request has already been processed. Please refresh.",
+        message:
+          "This request has already been processed. Please refresh.",
       });
     }
 
     return res.status(200).json({
       success: true,
-      message: `Booking status updated to ${status} successfully.`,
+      message:
+        status === "awaiting-payment"
+          ? "Final amount sent to customer successfully."
+          : status === "completed"
+            ? "Repair completion confirmed successfully."
+            : `Booking status updated to ${status} successfully.`,
       status,
-      completedAt:
-        status === "completed" ? now : null,
+      finalAmount:
+        status === "awaiting-payment"
+          ? Number(finalAmount)
+          : booking.finalAmount ?? null,
+      completedAt: status === "completed" ? now : null,
+      paymentStatus:
+        status === "awaiting-payment"
+          ? "unpaid"
+          : booking.paymentStatus,
     });
   } catch (error) {
     console.error("Update booking status error:", error);
@@ -1042,11 +1395,6 @@ app.put("/api/services/:id", async (req, res) => {
       });
     }
 
-    const filter = {
-      _id: new ObjectId(id),
-      technicianEmail: user.email,
-    };
-
     const updatedService = {
       title: title.trim(),
       category,
@@ -1056,14 +1404,15 @@ app.put("/api/services/:id", async (req, res) => {
       estimatedDuration: estimatedDuration.trim(),
       serviceMode,
       serviceArea: serviceArea.trim(),
-
       approvalStatus: "pending",
-
       updatedAt: new Date(),
     };
 
     const result = await serviceCollection.updateOne(
-      filter,
+      {
+        _id: new ObjectId(id),
+        technicianEmail: user.email,
+      },
       {
         $set: updatedService,
       }
@@ -1350,6 +1699,482 @@ app.patch(
 );
 
 // ==========================================
+// ADMIN: GET ALL BOOKINGS
+// GET /api/admin/bookings
+// ==========================================
+
+app.get("/api/admin/bookings", async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in first.",
+      });
+    }
+
+    if (user.role !== "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Admin access required.",
+      });
+    }
+
+    const bookings = await bookingCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      message: "Bookings fetched successfully.",
+      bookings,
+    });
+  } catch (error) {
+    console.error("Admin get bookings error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch bookings.",
+    });
+  }
+});
+
+// ==========================================
+// ADMIN: GET ALL USERS
+// GET /api/admin/users
+// ==========================================
+
+app.get("/api/admin/users", async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in first.",
+      });
+    }
+
+    if (user.role !== "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Admin access required.",
+      });
+    }
+
+    const users = await userCollection
+      .find(
+        {},
+        {
+          projection: {
+            name: 1,
+            email: 1,
+            image: 1,
+            role: 1,
+            phone: 1,
+            area: 1,
+            createdAt: 1,
+          },
+        }
+      )
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      message: "Users fetched successfully.",
+      users,
+    });
+  } catch (error) {
+    console.error("Admin get users error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch users.",
+    });
+  }
+});
+
+// ==========================================
+// ADMIN: UPDATE USER ROLE
+// PATCH /api/admin/users/:id/role
+// ==========================================
+
+app.patch("/api/admin/users/:id/role", async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in first.",
+      });
+    }
+
+    if (user.role !== "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Admin access required.",
+      });
+    }
+
+    const { id } = req.params;
+    const { role } = req.body || {};
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid user ID.",
+      });
+    }
+
+    if (!["customer", "technician", "admin"].includes(role)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid user role.",
+      });
+    }
+
+    const targetUserId = new ObjectId(id);
+
+    if (user._id.toString() === targetUserId.toString()) {
+      return res.status(403).json({
+        success: false,
+        message: "You cannot change your own role.",
+      });
+    }
+
+    const result = await userCollection.updateOne(
+      { _id: targetUserId },
+      {
+        $set: {
+          role,
+          roleSelectionPending: false,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found.",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "User role updated successfully.",
+      role,
+    });
+  } catch (error) {
+    console.error("Admin update user role error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update user role.",
+    });
+  }
+});
+
+// ==========================================
+// CUSTOMER: CREATE STRIPE CHECKOUT SESSION
+// POST /api/payments/create-checkout-session
+// ==========================================
+app.post("/api/payments/create-checkout-session",
+ async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in first.",
+      });
+    }
+
+    if (user.role !== "customer") {
+      return res.status(403).json({
+        success: false,
+        message: "Only customers can make payments.",
+      });
+    }
+
+    const { bookingId } = req.body || {};
+
+    if (!ObjectId.isValid(bookingId || "")) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid booking ID.",
+      });
+    }
+
+    const booking = await bookingCollection.findOne({
+      _id: new ObjectId(bookingId),
+      customerEmail: user.email,
+    });
+
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        message: "Booking not found.",
+      });
+    }
+
+    if (booking.status !== "awaiting-payment") {
+      return res.status(400).json({
+        success: false,
+        message: "Payment is available only after the technician requests the final amount.",
+      });
+    }
+
+    if (booking.paymentStatus === "paid") {
+      return res.status(400).json({
+        success: false,
+        message: "This booking has already been paid.",
+      });
+    }
+
+    const amount = Number(booking.finalAmount);
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid booking payment amount.",
+      });
+    }
+
+    // Reuse an existing open Stripe Checkout session
+    if (booking.stripeSessionId) {
+      try {
+        const existingSession =
+          await stripe.checkout.sessions.retrieve(
+            booking.stripeSessionId
+          );
+
+        if (
+          existingSession.status === "open" &&
+          existingSession.url
+        ) {
+          return res.status(200).json({
+            success: true,
+            checkoutUrl: existingSession.url,
+            sessionId: existingSession.id,
+          });
+        }
+      } catch (error) {
+        console.error(
+          "Existing Stripe session lookup:",
+          error.message
+        );
+      }
+    }
+
+    const currency = (
+      process.env.STRIPE_CURRENCY || "bdt"
+    ).toLowerCase();
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      
+      
+      customer_email: user.email,
+
+      line_items: [
+        {
+          price_data: {
+            currency,
+            product_data: {
+              name:
+                booking.serviceTitle ||
+                "FixMate Repair Service",
+              description: `Booking ID: ${booking._id.toString()}`,
+            },
+            unit_amount: Math.round(amount * 100),
+          },
+          quantity: 1,
+        },
+      ],
+
+      metadata: {
+        bookingId: booking._id.toString(),
+        customerEmail: user.email,
+      },
+
+      success_url:
+        `${CLIENT_URL}/dashboard/customer/bookings?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+
+      cancel_url:
+        `${CLIENT_URL}/dashboard/customer/bookings?payment=cancelled`,
+    });
+
+    const updateResult = await bookingCollection.updateOne(
+      {
+        _id: booking._id,
+        customerEmail: user.email,
+        status: "awaiting-payment",
+        paymentStatus: { $ne: "paid" },
+      },
+      {
+        $set: {
+          stripeSessionId: session.id,
+          paymentStatus: "pending",
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (updateResult.matchedCount === 0) {
+      return res.status(409).json({
+        success: false,
+        message: "Booking payment status changed. Please refresh and try again.",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Stripe checkout session created successfully.",
+      checkoutUrl: session.url,
+      sessionId: session.id,
+    });
+  } catch (error) {
+    console.error(
+      "Create Stripe checkout session error:",
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to create payment session.",
+    });
+  }
+});
+
+// ==========================================
+// CUSTOMER: GET MY PAYMENT HISTORY
+// GET /api/payments/my-payments
+// ==========================================
+
+app.get("/api/payments/my-payments", async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in to view your payments.",
+      });
+    }
+
+    if (user.role !== "customer") {
+      return res.status(403).json({
+        success: false,
+        message: "Only customers can view payment history.",
+      });
+    }
+
+    const payments = await paymentCollection
+      .find({
+        customerEmail: user.email,
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      message: "Payment history fetched successfully.",
+      payments,
+    });
+  } catch (error) {
+    console.error(
+      "Get customer payment history error:",
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch payment history.",
+    });
+  }
+});
+
+// ==========================================
+// ADMIN: GET ALL PAYMENT TRANSACTIONS
+// GET /api/admin/transactions
+// ==========================================
+
+app.get("/api/admin/transactions", async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in first.",
+      });
+    }
+
+    if (user.role !== "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Only admins can view transactions.",
+      });
+    }
+
+    const transactions = await paymentCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const revenueResult = await paymentCollection
+      .aggregate([
+        {
+          $match: {
+            status: "succeeded",
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            totalRevenue: {
+              $sum: "$amount",
+            },
+            totalTransactions: {
+              $sum: 1,
+            },
+          },
+        },
+      ])
+      .toArray();
+
+    const totalRevenue =
+      revenueResult[0]?.totalRevenue || 0;
+
+    const totalTransactions =
+      revenueResult[0]?.totalTransactions || 0;
+
+    return res.status(200).json({
+      success: true,
+      message: "Transactions fetched successfully.",
+      transactions,
+      summary: {
+        totalRevenue,
+        totalTransactions,
+      },
+    });
+  } catch (error) {
+    console.error("Admin transactions error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch transactions.",
+    });
+  }
+});
+
+// ==========================================
 // ROOT API
 // ==========================================
 
@@ -1386,6 +2211,16 @@ async function run() {
   try {
     await client.connect();
 
+    await paymentCollection.createIndex(
+      {
+        stripeSessionId: 1,
+      },
+      {
+        unique: true,
+        sparse: true,
+      }
+    );
+
     console.log("MongoDB Atlas connected successfully!");
     console.log("Database connected:", db.databaseName);
 
@@ -1411,7 +2246,14 @@ async function run() {
       console.log("Technician Booking Status Workflow is configured!");
 
       console.log("Admin Get All Services API is configured!");
+      console.log("Admin Get All Bookings API is configured!");
+      console.log("Admin Get All Users API is configured!");
       console.log("Admin Approve/Reject Service API is configured!");
+      console.log("Admin Update User Role API is configured!");
+
+      console.log("Stripe Checkout and Webhook APIs are configured!");
+      console.log("Customer Payment History API is configured!");
+      console.log("Admin Transactions API is configured!");
     });
   } catch (error) {
     console.error("Server startup failed:", error);
@@ -1422,4 +2264,3 @@ async function run() {
 run();
 
 export default app;
-
