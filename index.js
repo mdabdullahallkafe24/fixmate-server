@@ -28,6 +28,7 @@ dns.setServers(["1.1.1.1", "8.8.8.8"]);
 // ==========================================
 
 const app = express();
+app.set("trust proxy", 1);
 const PORT = process.env.PORT || 5000;
 
 const CLIENT_URL =
@@ -97,6 +98,12 @@ const auth = betterAuth({
   baseURL: process.env.BETTER_AUTH_URL,
   secret: process.env.BETTER_AUTH_SECRET,
   trustedOrigins: [CLIENT_URL],
+  advanced: {
+    defaultCookieAttributes: {
+      sameSite: "none",
+      secure: true,
+    },
+  },
 
   database: mongodbAdapter(db, {
     client,
